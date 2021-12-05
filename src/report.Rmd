@@ -1,0 +1,554 @@
+---
+title: "Zaawansowana Eksploracja Danych"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Wstęp
+
+Raport ten skupił swoją uwagę na zbiorze danych 'World Development Indicators', przygotowanym przez strone [WorldBank](https://www.worldbank.org/en/home) i analizie zależności między poszczególnymi miarami. Dodatkowymi zbiorami, które były wykorzystane w dalszej części raportu są dane dotyczące kryptowaluty bitcoin, ceny złota, danych S&P Composite oraz wartości walut w dolarach.
+
+Wpierw dane te zostały przetransformowane do odpowiednich struktur oraz wypełnione lub usunięte wartości puste.
+
+Kolejnym etapem analizy było poszukiwanie korelacje w zbiorze WDI. Większość korelacji była raczej oczywista (np. Populacja kobiet z populacją ogólnie), lecz niektóre z nich były bardziej interesujące. W szczególności uwagę zwracam na wykresy emisji gazów cieplarnianych i ich korelacją z GDP, Eksporterami/Importami czy wydatkami na turystykę.
+
+Często pojawiającą się korelacją była produkcja energii ze źródeł odnawialnych, gdzie również korelowała ona z Importami oraz eksportami.
+
+Wśród wykresów można było znaleźć nagły spadek emisji CO2 w latach 1989-1990, co zostało głębiej zbadane w raporcie.
+Dodatkowo sprawdzona została korelacja otrzymanego wsparcia finansowego z ilością bezpiecznych serwerów internetowych.
+
+Na końcu została podjęta próba utworzenia klasyfikatora w celu przewidzenia ceny bitcoina i została ona porównana z standardową metodą szeregów czasowych jaką jest ARMIA.
+
+# Wykorzystane biblioteki
+- tidyverse
+- readxl
+- corrplot
+- kableExtra
+- gridExtra
+- plotly
+- caret
+- gbm
+- randomForest
+- forecast
+- zoo
+```{r, results="hide", message=FALSE, warning=FALSE}
+  library(readxl)
+  library(tidyverse)
+  library(corrplot)
+  library(kableExtra)
+  library(gridExtra)
+  library(plotly)
+  library(caret)
+  library(gbm)
+  library(randomForest)
+  library(forecast)
+  library(zoo)
+```
+
+# Przygotowanie danych
+
+## Wczytywanie danych z pliku i podsumowanie surowego zbioru.
+```{r dataLoad, message=FALSE, warning=FALSE}
+source("preparation/DataPreparation.R")
+data <- readRawFiles()
+
+```
+Dane zawierają informacje dotyczące różnych miar określających poziom rozwoju krajów. Dodatkowo dostępne są dane giełdowe indeksu 'S&P Composite' oraz wartość dolara w poszczególnych walutach.
+W dalszej części analizowane są dane dotyczące bitcoinów oraz ceny złota w amerykańskich dolarach, euro oraz brytyjskim funcie.
+
+Wpierw zostały wczytane surowe dane (jedynie dane bitcoin zostały połączone po dacie), poniżej znajdziemy ich krótkie podsumowanie:
+
+- CurrencyExchangeRates.csv
+```{r rawDataSummaryCurrency, message=FALSE, warning=FALSE}
+kbl(summary(data$currency)) %>% 
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "450px")
+```
+Pierwszy zestaw to kursy walut w odniesieniu do dolara amerykańskiego. Zakres danych jest od 1995-01-02 do 2018-05-02 i liczba wierszy to `r nrow(data$currency)` W danych można zauważyć wiele brakujących wartości, czasem nawet ponad 50% wszystkich wierszy. Dane te potrzebują dalszego przetwarzania.
+
+
+- Gold prices.csv
+```{r rawDataSummaryGoldPrices, message=FALSE, warning=FALSE}
+kbl(summary(data$gold)) %>% 
+  kable_material(c("striped", "hover"))
+```
+
+Następnie zostały wczytane dane dotyczące ceny złota w zakresie od 1968-01-02 do 2021-09-28. Można zauważyć że najwięcej brakujących danych mamy w przypadku Euro, następnie GBP.
+
+- S&P Composite.csv
+```{r rawDataSummarySPComposite, message=FALSE, warning=FALSE, paged.print=TRUE}
+kbl(summary(data$sp)) %>% 
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "450px")
+```
+
+Kolejny zestaw to miesięczne wyniki S&P Composite w zakresie od 1871-01-31 do 2021-10-31. Dane te zdają się zawierać bardzo mało wartości pustych.
+
+- World_Development_Indicators.csv
+```{r rawDataSummaryWDI, message=FALSE, warning=FALSE, paged.print=TRUE}
+kbl(summary(data$wdi)) %>% 
+  kable_material(c("striped", "hover"))
+```
+
+Największy zbiór danych czyli dane dotyczące rozwoju poszczególnych krajów w latach 1970-2020. Początkowo zbiór ten zawierał dane dla poszczególnych lat w kolumnach, przy pomocy
+funkcji dostępnych w bibliotece tidyr zamienione zostały one na wiersze, a poszczególne lata umieszczono w kolumnie year. Można zauważyć ponad 1 mln brakujących wartości, więc skorzystanie z tego zbioru będzie wymagało zajęcia się tymi wartościami.
+
+- Bitcoin files joined
+```{r rawDataSummaryBitcoin, message=FALSE, warning=FALSE, paged.print=TRUE}
+kbl(summary(data$bitcoin)) %>% 
+  kable_material(c("striped", "hover"))
+
+```
+
+Ostatni zbiór danych to obrót bitcoinami w zakresie od 2009-01-03 do 2021-10-05. Dane te nie zawierają żadnych wartości brakujących. Wstępnie zostały już połączone dostępnie pliki na podstawie daty tworząc jeden dataset.
+
+## Wstępne przetwarzanie danych.
+
+W poprzedniej sekcji można było zauważyć, że niektóre zbiory zawierały wiele brakujących wartości. Dane dotyczące walut, złota oraz rozwoju krajów należało by przetworzyć i wypełnić wartości puste. Ze względu na to że są to zmienne które zmieniają się w czasie, uważam że dobrą metodą będzie wyciąganie średniej wartości z najbliższej dostępnej przed przetwarzaną pustą i po przetwarzanej pustej w danym zakresie. W ten sposób potencjalnie poprawnie zostanie zasymulowana zmiana tych wartości w czasie. Jednak jeżeli wartości brakujących jest bardzo dużo (przyjmijmy 35% wszystkich wierszy) dla danego atrybutu, taka kolumna nawet po wypełnieniu może być zakłamana, co powoduje że usunięcie takiej kolumny z zbiorów.
+
+```{r dataTransform, message=FALSE, warning=FALSE}
+source("preparation/DataPreparation.R")
+data <- runFilePreparation(data)
+
+```
+Po wykonaniu transformacji zbioru WDI poniżej ponownie znajduję się jego podsumowanie. 
+```{r preparedDataSummaryWDI,  results = "asis", echo = FALSE, message=FALSE, warning=FALSE}
+kbl(summary(data$wdi)) %>% 
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "450px")
+```
+
+Każdy indeks został przetransformowany w osobną kolumnę. Można zauważyć obecność wartości pustych. Wynika ona z tego, że dla części krajów ilość wartości pustych dla konkretnego indeksu mogła przekroczyć 35% przez co został on całkowicie usunięty z zbioru. Przy transformacji na kolumny jest to widoczne w postaci wartości pustych.
+Niektóre kraje również mimo zastąpienia wartości pustych mogły mieć niektóre wartości pozostawione bez zmian. Działo się tak dlatego, że nie wszystkie kraje posiadały informacje od początku zbioru, tzn od roku 1970. Wszelkie wartości puste które nie zawierały poprzednika są pozostawione puste. Uważam że jeżeli nie ma danych dla takich wierszy nie ma potrzeby sztucznie ich wypełniać.
+
+
+Drugim zbiorem danych, gdzie transformacja była konieczna jest zbiór GoldPrices. W nim cena złota z rana oraz z wieczoru została uśredniona dla każdego dnia, a wartości puste wynikały z średniej poprzedniej i następnej w czasie niepustej ceny.
+```{r preparedDataSummaryGoldPrices, message=FALSE, warning=FALSE}
+kbl(summary(data$gold)) %>% 
+  kable_material(c("striped", "hover"))
+```
+
+# Poszukiwanie korelacji
+
+## Proste korelacje w zbiorze WDI
+Pierwszym podjętym krokiem w poszukiwaniu korelacji jest znalezienie wszystkich, nawet tych co mogą wydawać się oczywiste. Poniżej znajduje się tabela korelacji w całym zbiorze WDI indeksów rozwoju dla progu |0.9|
+```{r wdiOverallCor, results = "asis", message=FALSE, warning=FALSE, echo=TRUE}
+cor_mat <- cor(select(data$wdi, -year, -`Country Name`), use="pairwise.complete.obs")
+cor_mat[!lower.tri(cor_mat)] <- NA
+cor_df <- data.frame(cor_mat) %>%
+    rownames_to_column() %>%
+    gather(key="variable", value="correlation", -rowname) %>%
+    filter(abs(correlation) > 0.9)
+
+cor_mat_mapped <- inner_join(cor_df, data$seriesMapping, by = c("rowname" = "Series Code")) %>% 
+  inner_join(data$seriesMapping, by = c("variable" = "Series Code"), suffix = c("_left", "_right"))
+  
+cor_mat_mapped %>% select(`Series Name_left`, `Series Name_right`, correlation) %>% 
+  arrange(desc(correlation)) %>% 
+  mutate(`Series Name_left` = str_remove(`Series Name_left`, '[$]')) %>% 
+  mutate(`Series Name_right` = str_remove(`Series Name_right`, '[$]'))%>%
+  kbl(col.names = c('First Index', 'Second Index', 'Correlation'), caption = "Korelacje w zbiorze WDI") %>% 
+  kable_material(c("striped", "hover")) %>% 
+  scroll_box(width = "100%", height = "500px")
+
+```
+
+Znalezionych zostało `r nrow(cor_mat_mapped)` korelacji, które mają wartość większą niż 0.9 lub mniejszą od -0.9.
+Po przeanalizowaniu tych korelacji można zauważyć, że zdecydowana większość z nich sprowadza się do zależności typu: Większa populacja powoduje więcej innej miary, np. **'Population, total'** koreluje z **'Labor force, total'** lub z **Secondary education, teachers**. Cześć obserwacji można powiedzieć jest oczywista, czyli większa populacja oznacza więcej kobiet, mężczyzn, ludzi w miastach i wsiach oraz większą emisję gazów cieplarnianych i wiele innych podobnych przypadków.
+
+
+## Ograniczenie do ciekawszych korelacji
+
+Z poprzedniej sekcji zostały wybrane ciekawsze korelacje, Poniżej znajduje się tabela zawierająca tylko te korelacje.
+
+```{r wdiReduceDatasetCor, message=FALSE, warning=FALSE}
+interestingIndexes <- c("NY.GDP.MKTP.CD", "IP.JRN.ARTC.SC", "BM.GSR.MRCH.CD", "EN.ATM.METH.KT.CE", "SP.POP.TOTL", "ER.H2O.INTR.K3", "EN.ATM.CO2E.LF.KT", "AG.LND.TOTL.UR.K2", "EN.ATM.METH.EG.KT.CE", "SP.URB.TOTL", "EN.ATM.CO2E.GF.KT", "BX.GSR.NFSV.CD", "ST.INT.XPND.CD", "BM.GSR.FCTY.CD", "NE.DAB.TOTL.CD", "DT.ODA.ODAT.CD", "IT.NET.SECR", "EN.ATM.CO2E.KT", "EN.ATM.GHGT.KT.CE", "DT.ODA.OATL.CD", "EG.ELC.RNWX.KH", "NE.IMP.GNFS.CD", "NE.EXP.GNFS.CD", "BX.GSR.MRCH.CD", "CM.MKT.TRAD.CD", "IS.RRS.TOTL.KM", "NY.GSR.NFCY.CN", "GC.TAX.GSRV.CN", "SL.AGR.EMPL.ZS", "SL.SRV.EMPL.ZS", "SP.RUR.TOTL.ZS", "SP.URB.TOTL.IN.ZS", "EN.ATM.CO2E.PC", "IT.NET.SECR.P6")
+
+interestingCorrelations <- c(0.9954725, 0.9877412, 0.9799969, 0.9653469, 0.9612249, 0.9611877, 0.9609462, 0.9587111, 0.9566631, 0.9349214, 0.9348930, 0.9348427, 0.9307033, 0.9291351, 0.9170828, 0.9059240, -0.9469317)
+interestingWDI <- data$wdi %>% select(year, `Country Name`, interestingIndexes )
+
+interestingPairs <- filter(cor_mat_mapped, round(correlation, digits = 7) %in% interestingCorrelations) %>%
+  rename("left" = "rowname", "right" = "variable") %>%
+  arrange(`Series Name_left`, `Series Name_right`, desc(correlation))
+
+interestingPairs %>%
+  select(`Series Name_left`, `Series Name_right`, correlation) %>% 
+  arrange(`Series Name_left`, `Series Name_right`, desc(correlation)) %>% 
+  mutate(`Series Name_left` = str_remove(`Series Name_left`, '[$]')) %>% 
+  mutate(`Series Name_right` = str_remove(`Series Name_right`, '[$]'))%>%
+  kbl(col.names = c('First Index', 'Second Index', 'Correlation'), 
+      caption = "Ciekawsze korelacje w zbiorze WDI") %>% 
+  kable_material(c("striped", "hover")) %>% 
+  scroll_box(width = "100%", height = "500px")
+
+```
+
+Mając ograniczony zbiór atrybutów WDI poniżej są widoczne wykresy dla każdej z par wybranych korelacji. Zostały one utworzone na podstawie średnich z całego świata w danych latach.
+
+
+```{r wdiCorGraphs, fig.align='center', fig.height=5, fig.width=10, message=FALSE, warning=FALSE}
+wdiMean <- interestingWDI %>% 
+  select(-`Country Name`) %>% 
+  group_by(year) %>% 
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE))) 
+
+for(i in 1:nrow(interestingPairs)) {
+
+  plot1 <-ggplot(wdiMean, aes(x = year), size = 2) +  
+    geom_line(aes(y = .data[[interestingPairs[i,1]]])) + 
+    geom_point(aes(y = .data[[interestingPairs[i,1]]])) +
+    ylab(interestingPairs[i,4]) + theme_bw(base_size = 8)
+  
+  plot2 <-ggplot(wdiMean, aes(x = year), size = 2 ) +  
+    geom_line(aes(y = .data[[interestingPairs[i,2]]])) + 
+    geom_point(aes(y = .data[[interestingPairs[i,2]]])) +
+    ylab(interestingPairs[i,5]) + theme_bw(base_size = 8)
+  
+  grid.arrange(plot1, plot2, ncol=2)
+}
+
+```
+
+Na wykresach można zauważyć parę oczywistych korelacji. Z czasem na ziemi jest coraz więcej ludzi, jednak jak dobrze wiemy emisje gazów cieplarnianych wciąż nie maleją więc została zauważona korelacja. Jednak w emisji ** CO2 emissions (kt) ** można zauważyć nagły spadek w latach 1989 - 1991. Dalsza analiza dla tego wykresu może być interesująca. Tak samo emisja CO2 koreluje z **International tourism, expenditures** jednak ciężko powiedzieć czy ma to jakikolwiek wpływ poza większą liczbą podróży do danego kraju (samoloty lub pojazdy).
+
+Innym częstym parametrem występującym w korelacjach jest produkcja elektryczności z odnawialnych źródeł (poza elektrowniami wodnymi), czyli **Electricity production from renewable sources, excluding hydroelectric (kWh)** w zbiorze. W ograniczonym zbiorze koreluje ona mocna z miarami dotyczącymi eksportu i importu. Można by powiedzieć, że większa zależność od energii 'czystej' powoduje lepszy handel międzynarodowy, jednak pewnie ta zależność jest raczej związana z rozwojem krajów ogólnie i nie ma między nimi związku przyczynowo skutkowego.
+
+Kolejnym parametrem którego obecność nie dziwi jest **GDP (current US$)**. Koreluje on z różnymi indeksami, między innymi z eksportem dóbr lub **Primary income payments (BoP, current US)**. Jednak bardziej interesujące dla dalszej analizy może być związek GDP z **Stocks traded, total value (current US)**. Widać na wykresach że może mieć on związek z stanem giełdy. Między 2008-2009 miała miejsce tzw. Wielka Recesja co można zauważyć w lekkim spadku światowego średniego GDP jak i w giełdzie.
+GDP koreluje również z liczbą artykułów naukowych, jednak ciężko stwierdzić czy ma to z sobą jakiś związek.
+
+Korelacją która zdawała się szczególnie interesująca jest **Net official development assistance received (current US)** z **Secure Internet servers**. Wynikałoby z niej, że kraje które otrzymują wsparcie, inwestują w bezpieczny internet.
+
+## Głębsza analiza dla paru krajów
+
+### Analiza emisji CO2 lata 1989-1991
+
+Z poprzedniej sekcji wykresy emisji gazów cieplarnianych zawierał ciekawy spadek w latach 1989-1991. Poniżej znajduje się wykres dla większych krajów z tamtego okresu, które potencjalnie emitowały duże ilości CO2
+
+```{r Co2EmmisionsBigCountries, message=FALSE, warning=FALSE, fig.align = 'center', fig.height=5, fig.width=10}
+countriesWithCo2 <- interestingWDI %>% 
+  filter(`Country Name` %in% c("China", "France","Russian Federation","United States")) %>%
+  mutate(frame = year)
+
+  plot1 <- ggplot(countriesWithCo2, aes(x = year, y = EN.ATM.CO2E.KT, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("CO2 emissions (kt)")
+  
+  plot2 <- ggplot(countriesWithCo2, aes(x = year, y = EN.ATM.CO2E.PC, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("CO2 emissions (metric tons per capita) ")
+  
+  
+  subplot(plot1, plot2, titleX = T, titleY=T)
+```
+
+Patrząc na wykresy, zmiana nastąpiła z roku 1989 na 1990, najwięcej w Rosji, w tamtych latach jeszcze ZSRR. Jednym z wydarzeń w latach 1989 - 1991 był rozpad ZSRR i osłabienie ekonomiczne sojuszu. Dla sprawdzenia czy może to miało wpływ na spadek poniżej znajduje się wykres części krajów należących do ZSRR i ich sojuszników.
+
+```{r ZSRREmmissions, message=FALSE, warning=FALSE, fig.align = 'center', fig.height=5, fig.width=10}
+
+countriesWithCo2 <- interestingWDI %>% 
+  filter(`Country Name` %in% c("Russian Federation", "Poland","Romania", "Hungary", "Bulgaria"))
+
+  plot1 <- ggplot(countriesWithCo2, aes(x = year, y = EN.ATM.CO2E.KT, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("CO2 emissions (kt)")
+  
+  plot2 <- ggplot(countriesWithCo2, aes(x = year, y = EN.ATM.CO2E.PC, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("CO2 emissions (metric tons per capita)")
+  
+  
+  subplot(style(plot1, showlegend = F), plot2, titleX = T, titleY=T)
+```
+
+```{r ZSRREmmissionsTop, message=FALSE, warning=FALSE, fig.align = 'center', fig.height=5, fig.width=10}
+table_for_co2 <-interestingWDI %>%
+  arrange(`Country Name`, year) %>%
+  mutate(CO2_emmision_pc_1989_1990_diff = EN.ATM.CO2E.PC - lag(EN.ATM.CO2E.PC, default = EN.ATM.CO2E.PC[1])) %>%
+  mutate(CO2_emmision_kt_1989_1990_diff = EN.ATM.CO2E.KT - lag(EN.ATM.CO2E.KT, default = EN.ATM.CO2E.KT[1])) %>%
+  filter( year == 1990, `Country Name` != 'Lower middle income', `Country Name` != 'World'
+          , `Country Name` != 'Middle income', `Country Name` != 'Lower middle') %>%
+  select(`Country Name`, CO2_emmision_pc_1989_1990_diff, CO2_emmision_kt_1989_1990_diff) %>%
+  arrange(CO2_emmision_pc_1989_1990_diff)
+kbl(format = "html", table_for_co2) %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "450px")
+```
+
+Zgodnie z tabelą powyżej największa zmiana nastąpiła dla Rosji/ZSRR, co może korelować z nadchodzącym rozpadem ZSRR. Jednak inne kraje komunistyczne miały również relatywnie duży spadek. Nawet Polska miała 10. największy spadek emisji CO2 na świecie per capita na przełomie 1989 i 1990 roku. Następna była Rumunia, Bułgaria i Węgry.
+
+Inne kraje które się wyróżniają w tabeli to kraje Arabskie. Wśród nich znajduje się Katar, Kuwejt, Bahrajn, Arabia Saudyjska. Dla tych krajów niestety nie znalazłem dobrego wyjaśnienia, możliwe że wiąże się to z mniejszym zużyciem węgla na rzecz ropy.
+
+### Analiza korelacji wsparcia pieniężnego a ilości bezpiecznych serwerów internetowych
+
+Inną ciekawą korelacją było **Net official development assistance received (current US)** z **Secure Internet servers** i poniżej chciałem na wykresie pokazać jak ta relacja wygląda dla krajów z sumarycznie największym **Net official development assistance received (current US)** po roku 2009 (wynika to z tego, że dane dotyczące **Secure Internet servers** zaczynają się od 2010 roku).
+
+
+```{r internetSecurity, message=FALSE, warning=FALSE, fig.align = 'center', fig.height=5, fig.width=11}
+highestAssitenceRecievied <- interestingWDI %>% 
+    filter(year >= 2009) %>%
+    select(-year) %>% 
+    group_by(`Country Name`) %>% 
+    summarise(assistanceSum = sum(DT.ODA.ODAT.CD, na.rm = T)) %>%
+    filter(`Country Name` != 'Lower middle income', `Country Name` != 'World'
+           , `Country Name` != 'Middle income', `Country Name` != 'Lower middle', `Country Name` != 'Low & middle income'
+           , `Country Name` != 'Low income', `Country Name` != 'Upper middle income', `Country Name` != 'High income'
+           ,`Country Name` != 'Israel', `Country Name` != 'Vietnam') %>%
+    arrange(desc(assistanceSum)) %>%
+    select(`Country Name`) %>% head(10)
+
+dataForGraphs <- interestingWDI %>% select(`Country Name`, year, DT.ODA.ODAT.CD, IT.NET.SECR.P6) %>%
+  filter(`Country Name` %in% highestAssitenceRecievied$`Country Name`, year >= 2009)
+
+plot1 <- ggplot(dataForGraphs, aes(x = year, y = DT.ODA.ODAT.CD, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("Net official development assistance received (current US$)")
+  
+plot2 <- ggplot(dataForGraphs, aes(x = year, y = IT.NET.SECR.P6, color= `Country Name`), size = 2) +  
+      geom_point() + 
+      geom_line() + 
+      ylab("Secure Internet servers (per 1 million people)")
+
+subplot(style(plot1, showlegend = F), plot2, titleX = T, titleY=T)
+```
+
+Na powyższych wykresach nie widać jasno korelacji, która była widoczna na grafie w skali światowej. Zdecydowana większość wykresów dla poszczególnych krajów nie ma widocznej tej zależności. Bangladesz, Nigeria oraz Syria potencjalnie mogły wykorzystywać te pieniądze między innymi na cele bezpieczeństwa w sieci, jednak nie jest to oczywiste. Najmocniej ewidentnie koreluje to w przypadku Bangladeszu.
+Można więc powiedzieć, że założenie że kraje które otrzymują wsparcie, inwestują w bezpieczny internet jest raczej nieprawdziwe.
+
+# Klasyfikator
+
+Ta sekcja jest przeznaczona na przewidywanie ceny bitcoina na podstawie zbioru danych bitcoin, ceny złota, S&P Composite oraz paru cech z zbioru WDI.
+
+## Przygotowanie zbioru wyjściowego
+
+Dla zbioru WDI istnieją tylko dane całoroczne, więc dla uproszczenia będą one takie same dla każdego roku w dostępnych danych bitcoin, które są wyjściowym zestawem danych, do którego dołączona zostanie reszta zbiorów. Wybrane atrybuty to:
+
+- GDP (current US dollars)
+- Stocks traded, total value (current US dollars)
+- Total greenhouse gas emissions (kt of CO2 equivalent)
+
+Uważam że te cechy mogą realnie korelować z cena bitcoina, jednak ich wartość będzie stała dla każdego roku, więc prawdopodobnie nie będą one wpływać mocno na predykcje.
+
+
+dodatkowo z zbioru wdi wybrane zostały tylko 3 kraje, które potencjalnie mogą mieć wpływ na ceny bitcoina, czyli:
+
+- China
+- United States
+- Russian Federation
+
+Są to kraje które są mocarstwami w skali światowej.
+
+Z zbioru SP Composite zostały wybrane wartości "S.P.Composite", "Dividend" oraz "Earnings". Dodatkowo cena złota w dolarach amerykańskich oraz wartość chińskiego Yuana również w dolarach amerykańskich.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+wdiForBitcoin <- data$wdi %>% select(`Country Name`, year, NY.GDP.MKTP.CD, CM.MKT.TRAD.CD, EN.ATM.GHGT.KT.CE) %>% 
+  filter(`Country Name` %in% c("China","Russian Federation","United States"), 
+         year >= as.numeric(format(min(data$bitcoin$Date),'%Y'))) %>% 
+  gather(Indicator, Value, -(`Country Name`:year)) %>% 
+  unite(temp, `Country Name`, Indicator) %>% 
+  spread(temp, Value)
+
+spForBitcoin <- data$sp %>% select(Date, S.P.Composite, Dividend, Earnings) %>% 
+  filter( as.numeric(format(Date ,'%Y')) >=as.numeric(format(min(data$bitcoin$Date),'%Y'))) %>%
+  mutate(year_month = format(Date ,'%Y_%m'))
+
+goldForBitcoin <- data$gold %>% select(Date, USD_Mean) %>% 
+  filter(as.numeric(format(Date ,'%Y')) >= as.numeric(format(min(data$bitcoin$Date),'%Y')))
+
+currencyForBitcoin <- data$currency %>% select(Date, Chinese.Yuan) %>% 
+  filter(as.numeric(format(Date ,'%Y')) >= as.numeric(format(min(data$bitcoin$Date),'%Y')))
+
+classificatorDf <- data$bitcoin %>% mutate(year = as.numeric(format(Date,'%Y'))) %>%
+  filter(year < 2021) %>%
+  left_join(wdiForBitcoin, by = "year") %>%
+  mutate(year_month = format(Date ,'%Y_%m')) %>%
+  left_join(spForBitcoin, by = "year_month") %>%
+  mutate(Date = Date.x) %>% select(-Date.y, -Date.x) %>%
+  left_join(goldForBitcoin, by = "Date") %>%
+  left_join(currencyForBitcoin, by = "Date") %>%
+  select(-year, -year_month) %>%
+  arrange(Date)
+
+```
+
+Mimo iż dane były wcześniej czyszczone, po połączeniu z zbiorem bitcoin pojawiły się nam wartości puste (dokładnie jest ich `r sum(is.na(classificatorDf)) `. Konkretnie są one widoczne w cenie złota oraz wartości Yuana z powodu brakujących dat. W celu wypełnienia tych wartości użyje podobnej strategii jak w przypadku wcześniejszego czyszczenia zbioru, tzn. policzymy wartości średnie między wartościami przed i po wartości pustej.
+
+Dodatkowo bitcoin zawiera wartości w polu 'MarketPrice' > 0 od dnia 2010-08-18, z tego względu wszystkie wiersze z datą mniejszą niż powyższa zostały usunięte.
+
+Ostatnim atrybutem potrzebującym poprawy jest "TradeVolume", w niektórych wierszach znajduje się tam wartość pusta co wydaje się być błędem. Uważam że należy je wypełnić po raz kolejny średnią wartości przed wierszem z 0 i po wierszu z 0 w tej kolumnie.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+
+classificatorDf[classificatorDf$TradeVolume == 0, "TradeVolume"] = NA
+classificatorDfWithDate <- classificatorDf %>%
+  filter(Date >= "2010-08-18") %>% 
+  mutate(GoldValue = zoo::na.approx(`USD_Mean`, na.rm = FALSE))%>%
+  mutate(GoldValue = zoo::na.locf(GoldValue, na.rm = FALSE)) %>% 
+  mutate(Chinese.Yuan = zoo::na.approx(Chinese.Yuan, na.rm = FALSE))%>%
+  mutate(Chinese.Yuan = zoo::na.locf(Chinese.Yuan, na.rm = FALSE)) %>%
+  mutate(TradeVolume = zoo::na.approx(TradeVolume, na.rm = FALSE))%>%
+  mutate(TradeVolume = zoo::na.locf(TradeVolume, na.rm = FALSE)) %>%
+  select(-USD_Mean)
+
+
+classificatorDf <- classificatorDfWithDate %>% 
+  select(-Date)
+sum(is.na(classificatorDf))
+
+kbl(format = "html", classificatorDf) %>%
+  kable_material(c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "450px")
+```
+
+W ten sposób utworzony został widoczny powyżej zestaw atrybutów w celu predykcji ceny bitcoina.
+
+## Przygotowanie do trenowania modelu
+
+W celu przygotowania modelu należy utworzyć zbiór testowy i uczący. W przypadku bitcoina, który jest zbiorem który zmienia się w czasie nie możemy zrobić tego w sposób losowy, powinniśmy podzielić go tak żeby nie uczył się on na danych z 'przyszłości'. W tym wypadku wykonany jest podział 80%/20% na posortowanym wcześniej po dacie zbiorze.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+
+bitcoinTrainDf <- classificatorDf[1:round(nrow(classificatorDf)*0.8,0),]
+bitcointTestDf <- classificatorDf[(round(nrow(classificatorDf)*0.8,0)+ 1):nrow(classificatorDf),]
+
+```
+
+W zbiorze terningowym jest `r nrow(bitcoinTrainDf)` wierszy, a w zbiorze testowym `r nrow(bitcointTestDf)`.
+
+Kolejnym krokiem jest ustalenie sposobu trenowania zbioru, dla naszego problemu związanego z przemijającym czasem możemy użyć metody 'timeslice' co powoduje przesuwanie się zbioru uczącego i walidującego. Dzięki temu nie będzie przypadków gdzie model uczy się na podstawie przyszłości.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+trainParameters <- trainControl(method = "timeslice", fixedWindow = T, initialWindow = 400, horizon = 100, skip = 200)
+```
+
+### Uczenie zbioru algorytmem Random Forest
+
+Algorytmem użytym do ćwiczenia modelu jest algorytm **Random Forest**. Jest to pierwszy algorytm, którego skuteczność warto sprawdzić.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+set.seed(42)
+randomForestGrid <- expand.grid(mtry = 20:30)
+randomForestFit <- train(MarketPrice  ~ .,
+                   data = bitcoinTrainDf,
+                   method = "rf",
+                   trControl = trainParameters,
+                   tuneGrid = randomForestGrid,
+                   verbose = F,
+                   ntree = 50)
+randomForestFit
+```
+
+### Predykcja modelem z algorytmu Random Forest
+
+Tak jak wypisała metoda train, predykcje sprawdzimy pod kątem trzech metryk, czyli RMSE, MAE oraz Rsquared.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+predictionResults <- predict(randomForestFit, newdata = bitcointTestDf)
+rsq <- function(x, y) {
+  cor(x, y) ^ 2
+}
+mae <- MAE(predictionResults, bitcointTestDf$MarketPrice)
+rsme <- RMSE(predictionResults, bitcointTestDf$MarketPrice)
+rsquared <- rsq(predictionResults, bitcointTestDf$MarketPrice)
+```
+
+Wyniki predykcji dla algorytmu Random Forest to:
+
+- MAE **`r mae`**
+- RSME **`r rsme`**
+- RSquared **`r rsquared`**
+
+Nie wydają się one zbyt dobre, dlatego sprawdzimy jeszcze jeden popularny algorytm
+
+### Uczenie zbioru algorytmem Stochastic Gradient Boosting
+
+Drugim algorytmem, którym spróbujemy przewidzieć ceny bitcoina będzie Stochastic Gradient Boosting.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+set.seed(42)
+bitcoimGBMFit <- train(MarketPrice ~ ., 
+                data = bitcoinTrainDf, 
+                method = "gbm",  
+                trControl = trainParameters, 
+                verbose = F)
+bitcoimGBMFit
+```
+
+### Predykcja modelem z algorytmu Stochastic Gradient Boosting
+
+Tak samo jak w przypadku algorytmu Random Forest wykorzystamy te same metryki.
+
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+predictionResultsGBM <- predict(bitcoimGBMFit, newdata = bitcointTestDf)
+rsq <- function(x, y) {
+  cor(x, y) ^ 2
+}
+maeGBM <- MAE(predictionResultsGBM, bitcointTestDf$MarketPrice)
+rsmeGBM <- RMSE(predictionResultsGBM, bitcointTestDf$MarketPrice)
+rsquaredGBM <- rsq(predictionResultsGBM, bitcointTestDf$MarketPrice)
+```
+
+Wyniki predykcji dla algorytmu Stochastic Gradient Boosting to:
+
+- MAE **`r maeGBM`**
+- RSME **`r rsmeGBM`**
+- RSquared **`r rsquaredGBM`**
+
+RSME jest większe od algorytmu Random Forest, czyli jesteśmy dalej od wyniku prawdziego. Równocześnie RSquared jest mniejsze, czyli gorzej wyjaśnia wartość niz Random Forest. W ogólności możemy powiedzieć, że poradził sobie gorzej niż Random Forest.
+## Ważności atrybutów
+
+Sprawdźmy ważności atrybutów dla Random Forest:
+```{r, message=FALSE, warning=FALSE}
+plot(varImp(randomForestFit))
+```
+
+Najważniejszym atrybutem dla RF była trudność w 'kopaniu' bitcoina. Jest to całkiem sensowny wybór, wraz z wzrostem trudności, opłacalność wydobywania bitcoina spada, jednak jest to wyrównywane z ceną, więc wraz z wzrostem trudności można spodziewać się wzrostu ceny.
+
+Wygląda na to że SP Composite również grał ważną rolę w predykcji, jest to najważniejszy parametr spoza zestawu bitcoin. Może to sugerować, że giełda również wpływa na ceny kryptowalut.
+
+Ostatnią rzeczą na którą chcę zwrócić uwagę to lekki wpływ emisji gazów cieplarnianych w Chinach oraz USA. Wskazuje to na fakt, że kopanie kryptowalut zużywa gigantyczne ilości energii. Wraz z diametralnym wzrostem ceny bitcoina prawdopodobnie wzrosła liczba osób je wydobywającym, co mogło wpłynąć na emisje gazów cieplarnianych.
+
+## Predykcja z wykorzystaniem metody ARIMA
+
+Jako iż nasz problem dotyczy danych typu "time series", spróbuje wykorzystać jedną z standardowych metod analizy szeregów czasowych.
+
+### Podział zbioru na testowy oraz terningowy
+```{r, message=FALSE, warning=FALSE, echo = TRUE}
+
+arimaTrainDf <- classificatorDfWithDate[1:round(nrow(classificatorDf)*0.8,0),] %>% select(Date, MarketPrice)
+arimaTestDf <- classificatorDfWithDate[(round(nrow(classificatorDf)*0.8,0)+ 1):nrow(classificatorDf),] %>% select(Date, MarketPrice)
+
+arimaTrainDf <- zoo(arimaTrainDf$MarketPrice, seq(from = min(arimaTrainDf$Date), to = max(arimaTrainDf$Date), by = 1 ))
+arimaTestDf <- zoo(arimaTestDf$MarketPrice, seq(from = min(arimaTestDf$Date), to = max(arimaTestDf$Date), by = 1))
+
+```
+
+80% wartości zostało przeznaczone do trenowania, reszta trafiła do zbioru testowego. Z względu na to że ARIMA wymaga jednowymarowego szeregou czasowego, wymagana była transformacja w wektor przewidywanej wartości.
+
+### Uczenie przy wykorzystaniu metody ARIMA
+
+```{r}
+arimaFit <- auto.arima(arimaTrainDf, trace = T, d = 1)
+```
+
+Biblioteka **forecast** umożliwia automatyczne dobranie parametrów i nauke modelu na najlepszy zestawie. Tak utworzony model zostanie wykorzystany do predykcji.
+
+### Predykcja z wykorzystaniem modelu ARIMA
+
+```{r, echo = FALSE}
+kbl(format = "html", accuracy(forecast(arimaFit, h = 50), arimaTestDf[1:50,])) %>% 
+  kable_material(c("striped", "hover"))
+```
+
+Patrząc na parametr RMSE zdaje się że metoda ARIMA działa lepiej niż algorytm Random Forest. Jednym wnioskiem, który przychodzi do głowy jest fakt, że czasem lepiej jest użyć standardowych metod dla danego problemu, niż tworzyć modele przy pomocy algorytmów uczenia maszynowego.
+
